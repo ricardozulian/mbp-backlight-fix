@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MacBookPro gmux DPMS helper
+Comment=Keep X DPMS timeouts so simpledrm blanks and gmux PWM can turn off
+Exec=/usr/local/sbin/mbp-session-blank
+X-GNOME-Autostart-Phase=Application
+X-GNOME-Autostart-Delay=8
+NoDisplay=true

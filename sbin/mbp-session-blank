@@ -1,0 +1,164 @@
+#!/usr/bin/python3
+"""Keep X DPMS Off-timeout in sync with Cinnamon so simpledrm actually blanks.
+
+csd-power sets DPMS timeouts to 0 and calls gnome_rr_screen_set_dpms_mode(),
+which fails on the EFI simpledrm "None-1" output. Idle then never sets
+/sys/class/drm/*/dpms=Off, so mbp-backlight-watch never kills gmux PWM.
+
+This session helper writes the X DPMS Off time from Cinnamon's
+sleep-display-ac / sleep-display-battery. X then blanks simpledrm; the
+system watcher turns the PWM off. Respects logind/GNOME idle inhibitors
+(video playback, etc.).
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+POLL_SEC = 5.0
+
+
+def log(msg: str) -> None:
+    print(f"mbp-session-blank: {msg}", flush=True)
+
+
+def on_ac() -> bool:
+    for path in Path("/sys/class/power_supply").glob("*/type"):
+        try:
+            if path.read_text().strip() != "Mains":
+                continue
+            online = (path.parent / "online").read_text().strip()
+            return online == "1"
+        except OSError:
+            continue
+    return True
+
+
+def gsettings_uint(schema: str, key: str, default: int) -> int:
+    try:
+        out = subprocess.check_output(
+            ["gsettings", "get", schema, key], text=True
+        ).strip()
+        # uint32 600  or  600
+        parts = out.replace("uint32", "").strip()
+        return int(parts)
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        return default
+
+
+def display_off_timeout() -> int:
+    schema = "org.cinnamon.settings-daemon.plugins.power"
+    if on_ac():
+        return gsettings_uint(schema, "sleep-display-ac", 600)
+    return gsettings_uint(schema, "sleep-display-battery", 300)
+
+
+def idle_inhibited() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["systemd-inhibit", "--list", "--no-legend", "--no-pager"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        out = ""
+    for line in out.splitlines():
+        lower = line.lower()
+        # X already resets DPMS on input. Ignore this agent's own idle lock
+        # or the screen never blanks while a chat turn is in progress.
+        if "grok" in lower or "agent turn" in lower:
+            continue
+        if "block" in lower and "idle" in lower:
+            return True
+    try:
+        out = subprocess.check_output(
+            [
+                "busctl",
+                "--user",
+                "call",
+                "org.gnome.SessionManager",
+                "/org/gnome/SessionManager",
+                "org.gnome.SessionManager",
+                "IsInhibited",
+                "u",
+                "8",  # INHIBIT_IDLE
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return "true" in out.lower() or out.strip().endswith("b true")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def xset(*args: str) -> None:
+    subprocess.run(["xset", *args], check=False, stdout=subprocess.DEVNULL)
+
+
+def current_dpms_off() -> int | None:
+    try:
+        out = subprocess.check_output(["xset", "q"], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    for line in out.splitlines():
+        if "Standby:" in line and "Off:" in line:
+            # Standby: 0    Suspend: 0    Off: 600
+            try:
+                return int(line.split("Off:")[1].split()[0])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def apply_timeout(seconds: int) -> None:
+    xset("+dpms")
+    xset("s", "off")
+    xset("dpms", "0", "0", str(max(0, seconds)))
+
+
+def lock_or_die() -> None:
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/user-{os.getuid()}"))
+    runtime.mkdir(parents=True, exist_ok=True)
+    lock_path = runtime / "mbp-session-blank.lock"
+    fh = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another instance is running")
+        sys.exit(0)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    # leak fh so the lock is held until process exit
+
+
+def main() -> int:
+    if not os.environ.get("DISPLAY"):
+        log("DISPLAY is not set")
+        return 1
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    lock_or_die()
+    log(f"started DISPLAY={os.environ.get('DISPLAY')}")
+    last: int | None = None
+    while True:
+        timeout = display_off_timeout()
+        desired = 0 if idle_inhibited() or timeout <= 0 else timeout
+        have = current_dpms_off()
+        if have != desired:
+            apply_timeout(desired)
+            log(f"DPMS Off timeout {have} -> {desired}s (ac={on_ac()} inhibited={idle_inhibited()})")
+            last = desired
+        elif last is None:
+            last = desired
+            log(f"DPMS Off timeout already {desired}s")
+        time.sleep(POLL_SEC)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

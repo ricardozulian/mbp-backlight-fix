@@ -1,0 +1,22 @@
+# Kernel module build (do not publish)
+*.o
+*.ko
+*.ko.zst
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+Module.symvers
+modules.order
+.module-common.o
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+*~
+*.swp
+.DS_Store
+.directory

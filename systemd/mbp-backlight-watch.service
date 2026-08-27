@@ -1,0 +1,13 @@
+[Unit]
+Description=Turn Apple gmux backlight off when the panel blanks
+After=mbp-gmux-bridge.service systemd-udevd.service
+Wants=mbp-gmux-bridge.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/mbp-backlight-watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

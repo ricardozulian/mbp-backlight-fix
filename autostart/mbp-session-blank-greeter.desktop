@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MacBookPro gmux DPMS helper (GDM greeter)
+Comment=Keep X DPMS timeouts on the login screen
+Exec=/usr/local/sbin/mbp-session-blank
+OnlyShowIn=GDM;
+X-GNOME-Autostart-Phase=Application
+NoDisplay=true

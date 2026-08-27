@@ -1,0 +1,13 @@
+[Unit]
+Description=X DPMS Off timeout on GDM greeter and all local X servers
+After=display-manager.service
+Wants=display-manager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/mbp-system-blank
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target

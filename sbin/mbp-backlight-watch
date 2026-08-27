@@ -1,0 +1,266 @@
+#!/usr/bin/python3
+"""Turn gmux backlight off when the panel is blanked, the lid is closed,
+or the seat has been idle long enough.
+
+simpledrm / GDM-Wayland can paint a black screen without setting DRM DPMS.
+The GDM greeter on this machine is mutter-on-simpledrm (no Xorg), so xset
+never runs until after login. Idle is measured from keyboard/mouse/trackpad
+evdev events so PWM still goes off on a freshly booted login screen.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HELPER = Path("/usr/local/sbin/mbp-backlight")
+CONF = Path("/etc/default/mbp-backlight")
+POLL_SEC = 0.4
+WAIT_BACKLIGHT_SEC = 2.0
+INPUT_RESCAN_SEC = 15.0
+EVENT_FMT = "llHHi"  # timeval sec/usec, type, code, value
+EVENT_SIZE = struct.calcsize(EVENT_FMT)
+EV_KEY, EV_REL, EV_ABS = 0x01, 0x02, 0x03
+SKIP_IN_NAME = (
+    "lid switch",
+    "power button",
+    "sleep button",
+    "hda ",
+    "hdmi",
+    "pc speaker",
+    "video bus",
+)
+
+
+def log(msg: str) -> None:
+    print(f"mbp-backlight-watch: {msg}", flush=True)
+
+
+def read_text(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+
+
+def on_ac() -> bool:
+    for path in Path("/sys/class/power_supply").glob("*/type"):
+        try:
+            if path.read_text().strip() != "Mains":
+                continue
+            return (path.parent / "online").read_text().strip() == "1"
+        except OSError:
+            continue
+    return True
+
+
+def idle_timeout_sec() -> int:
+    ac, bat = 600, 300
+    if CONF.is_file():
+        for line in CONF.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip("'\"")
+            try:
+                if key == "DPMS_OFF_AC":
+                    ac = int(val)
+                elif key == "DPMS_OFF_BATTERY":
+                    bat = int(val)
+            except ValueError:
+                continue
+    return ac if on_ac() else bat
+
+
+def idle_inhibited() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["systemd-inhibit", "--list", "--no-legend", "--no-pager"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    for line in out.splitlines():
+        lower = line.lower()
+        if "grok" in lower or "agent turn" in lower:
+            continue
+        if "block" in lower and "idle" in lower:
+            return True
+    return False
+
+
+def lid_closed() -> bool:
+    states = glob.glob("/proc/acpi/button/lid/*/state")
+    if not states:
+        return False
+    for path in states:
+        value = read_text(path) or ""
+        if "closed" in value.lower():
+            return True
+    return False
+
+
+def displays_blanked() -> bool:
+    found = False
+    any_on = False
+    for conn in glob.glob("/sys/class/drm/card*-*-*"):
+        if not Path(conn, "dpms").is_file():
+            continue
+        status = (read_text(os.path.join(conn, "status")) or "").lower()
+        if status == "disconnected":
+            continue
+        enabled = (read_text(os.path.join(conn, "enabled")) or "").lower()
+        if enabled and enabled != "enabled":
+            continue
+        found = True
+        dpms = read_text(os.path.join(conn, "dpms")) or ""
+        if dpms == "On":
+            any_on = True
+    if not found:
+        return False
+    return not any_on
+
+
+def input_name(event_dev: Path) -> str:
+    sysfs = Path("/sys/class/input") / event_dev.name / "device" / "name"
+    return (read_text(str(sysfs)) or "").lower()
+
+
+def open_inputs() -> list[int]:
+    fds: list[int] = []
+    for dev in sorted(Path("/dev/input").glob("event*")):
+        name = input_name(dev)
+        if any(s in name for s in SKIP_IN_NAME):
+            continue
+        try:
+            fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        fds.append(fd)
+    return fds
+
+
+def close_inputs(fds: list[int]) -> None:
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def drain_activity(fds: list[int]) -> bool:
+    active = False
+    for fd in fds:
+        while True:
+            try:
+                buf = os.read(fd, EVENT_SIZE * 32)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not buf:
+                break
+            for off in range(0, len(buf) - EVENT_SIZE + 1, EVENT_SIZE):
+                _sec, _usec, typ, _code, val = struct.unpack_from(
+                    EVENT_FMT, buf, off
+                )
+                if typ in (EV_KEY, EV_REL, EV_ABS) and val != 0:
+                    active = True
+    return active
+
+
+def backlight_ready() -> bool:
+    return Path("/sys/class/backlight/gmux_backlight/brightness").is_file()
+
+
+def run_helper(action: str) -> None:
+    subprocess.run([str(HELPER), action], check=False)
+
+
+class InputIdle:
+    def __init__(self) -> None:
+        self.fds: list[int] = []
+        self.last_input = time.monotonic()
+        self.last_scan = 0.0
+        self.rescan()
+
+    def rescan(self) -> None:
+        close_inputs(self.fds)
+        self.fds = open_inputs()
+        self.last_scan = time.monotonic()
+        log(f"watching {len(self.fds)} input devices")
+
+    def pump(self, timeout: float) -> None:
+        now = time.monotonic()
+        if now - self.last_scan >= INPUT_RESCAN_SEC:
+            self.rescan()
+        if not self.fds:
+            select.select([], [], [], timeout)
+            return
+        try:
+            ready, _, _ = select.select(self.fds, [], [], timeout)
+        except (OSError, ValueError):
+            self.rescan()
+            return
+        if ready and drain_activity(ready):
+            self.last_input = time.monotonic()
+
+    def idle_sec(self) -> float:
+        return time.monotonic() - self.last_input
+
+
+def desired_off(idle: InputIdle) -> bool:
+    if lid_closed() or displays_blanked():
+        return True
+    timeout = idle_timeout_sec()
+    if timeout <= 0 or idle_inhibited():
+        return False
+    return idle.idle_sec() >= timeout
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    log("waiting for gmux_backlight")
+    while not backlight_ready():
+        time.sleep(WAIT_BACKLIGHT_SEC)
+
+    log("gmux_backlight present")
+    run_helper("save")
+    idle = InputIdle()
+    last = desired_off(idle)
+    log(f"initial blanked={last} idle_timeout={idle_timeout_sec()}s")
+
+    while True:
+        if not backlight_ready():
+            last = None
+            time.sleep(WAIT_BACKLIGHT_SEC)
+            continue
+        idle.pump(POLL_SEC)
+        off = desired_off(idle)
+        if last is None:
+            last = off
+            run_helper("save")
+            continue
+        if off != last:
+            if off:
+                log("blank/lid/idle -> backlight off")
+                run_helper("off")
+            else:
+                log("activity -> backlight on")
+                run_helper("on")
+            last = off
+
+
+if __name__ == "__main__":
+    sys.exit(main())

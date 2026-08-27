@@ -1,0 +1,14 @@
+[Unit]
+Description=Unstick Apple gmux backlight PCI bridge (MacBookPro11,3)
+DefaultDependencies=no
+After=sysinit.target
+Before=display-manager.service gdm.service gdm3.service
+ConditionPathExists=/sys/class/dmi/id/product_name
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mbp-gmux-bridge.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

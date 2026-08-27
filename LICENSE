@@ -1,0 +1,11 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+This repository contains:
+
+- dkms/apple-gmux.c — Linux kernel driver, GPL-2.0-only
+  (from Linux 6.14, drivers/platform/x86/apple-gmux.c, with a local change
+  to always register gmux_backlight). See the file header for copyright.
+- Remaining scripts, units, and documentation — GPL-2.0-only.
+
+You can find the full GNU General Public License version 2 at:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.html

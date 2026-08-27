@@ -1,0 +1,115 @@
+#!/usr/bin/python3
+"""Control the Apple gmux panel backlight (MacBookPro11,3)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+BACKLIGHT = Path("/sys/class/backlight/gmux_backlight")
+STATE_DIR = Path("/var/lib/mbp-backlight")
+SAVED = STATE_DIR / "saved_brightness"
+DEFAULT_RESTORE = 400
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="ascii").strip()
+
+
+def _write(path: Path, value: str | int) -> None:
+    path.write_text(f"{value}\n", encoding="ascii")
+
+
+def require_backlight() -> None:
+    if not (BACKLIGHT / "brightness").is_file():
+        sys.stderr.write(
+            "mbp-backlight: /sys/class/backlight/gmux_backlight is missing.\n"
+            "Boot with acpi_backlight=apple_gmux (see mbp-backlight-fix).\n"
+        )
+        sys.exit(2)
+
+
+def current_brightness() -> int:
+    try:
+        return int(_read(BACKLIGHT / "actual_brightness"))
+    except OSError:
+        return int(_read(BACKLIGHT / "brightness"))
+
+
+def save_brightness(value: int) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if value > 0:
+        _write(SAVED, value)
+
+
+def saved_brightness() -> int:
+    try:
+        value = int(_read(SAVED))
+        if value > 0:
+            return value
+    except (OSError, ValueError):
+        pass
+    try:
+        maximum = int(_read(BACKLIGHT / "max_brightness"))
+        return max(1, min(DEFAULT_RESTORE, maximum))
+    except (OSError, ValueError):
+        return DEFAULT_RESTORE
+
+
+def backlight_off() -> None:
+    require_backlight()
+    try:
+        save_brightness(current_brightness())
+    except OSError:
+        pass
+    # bl_power: 0 = on, 4 = FB_BLANK_POWERDOWN. apple-gmux then writes PWM 0.
+    _write(BACKLIGHT / "brightness", 0)
+    try:
+        _write(BACKLIGHT / "bl_power", 4)
+    except OSError:
+        pass
+
+
+def backlight_on() -> None:
+    require_backlight()
+    try:
+        _write(BACKLIGHT / "bl_power", 0)
+    except OSError:
+        pass
+    _write(BACKLIGHT / "brightness", saved_brightness())
+
+
+def status() -> None:
+    if not (BACKLIGHT / "brightness").is_file():
+        print("backlight: missing")
+        return
+    print(f"brightness={_read(BACKLIGHT / 'brightness')}")
+    print(f"actual={_read(BACKLIGHT / 'actual_brightness')}")
+    print(f"max={_read(BACKLIGHT / 'max_brightness')}")
+    print(f"bl_power={_read(BACKLIGHT / 'bl_power')}")
+    print(f"saved={SAVED.read_text().strip() if SAVED.is_file() else '-'}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("off", "on", "status", "save"))
+    args = parser.parse_args()
+    if os.geteuid() != 0 and args.action != "status":
+        sys.stderr.write("mbp-backlight: need root to change backlight\n")
+        return 1
+    if args.action == "off":
+        backlight_off()
+    elif args.action == "on":
+        backlight_on()
+    elif args.action == "save":
+        require_backlight()
+        save_brightness(current_brightness())
+    else:
+        status()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

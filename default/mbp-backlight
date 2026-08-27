@@ -1,0 +1,4 @@
+# Seconds before X DPMS Off (simpledrm blank). mbp-system-blank applies this
+# to the GDM greeter and every user X server. Match Cinnamon sleep-display-*.
+DPMS_OFF_AC=600
+DPMS_OFF_BATTERY=300

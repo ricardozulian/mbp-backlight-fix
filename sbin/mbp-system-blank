@@ -1,0 +1,192 @@
+#!/usr/bin/python3
+"""Apply X DPMS Off-timeout on every local X server, including the GDM greeter.
+
+Runs as root from boot. simpledrm only blanks when the X DPMS Off timer is
+non-zero; Cinnamon/GNOME zero that timer and use gnome-rr, which fails on
+the EFI None-1 output. mbp-backlight-watch then never sees dpms=Off.
+
+This process finds each Xorg (greeter and user sessions) and keeps
+`xset dpms 0 0 <timeout>` set so a freshly booted login screen also goes dark.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+POLL_SEC = 3.0
+CONF = Path("/etc/default/mbp-backlight")
+
+
+def log(msg: str) -> None:
+    print(f"mbp-system-blank: {msg}", flush=True)
+
+
+def on_ac() -> bool:
+    for path in Path("/sys/class/power_supply").glob("*/type"):
+        try:
+            if path.read_text().strip() != "Mains":
+                continue
+            return (path.parent / "online").read_text().strip() == "1"
+        except OSError:
+            continue
+    return True
+
+
+def conf_timeouts() -> tuple[int, int]:
+    ac, bat = 600, 300
+    if CONF.is_file():
+        for line in CONF.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip("'\"")
+            if key == "DPMS_OFF_AC":
+                ac = int(val)
+            elif key == "DPMS_OFF_BATTERY":
+                bat = int(val)
+    return ac, bat
+
+
+def desired_timeout() -> int:
+    ac, bat = conf_timeouts()
+    return ac if on_ac() else bat
+
+
+def idle_inhibited() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["systemd-inhibit", "--list", "--no-legend", "--no-pager"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    for line in out.splitlines():
+        lower = line.lower()
+        if "grok" in lower or "agent turn" in lower:
+            continue
+        if "block" in lower and "idle" in lower:
+            return True
+    return False
+
+
+def parse_proc_cmdline(pid: Path) -> list[str]:
+    raw = (pid / "cmdline").read_bytes().split(b"\0")
+    return [c.decode("utf-8", "replace") for c in raw if c]
+
+
+def proc_uid(pid: Path) -> int | None:
+    try:
+        for line in (pid / "status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def iter_xorg() -> list[dict]:
+    found: list[dict] = []
+    for pid in Path("/proc").iterdir():
+        if not pid.name.isdigit():
+            continue
+        try:
+            args = parse_proc_cmdline(pid)
+        except OSError:
+            continue
+        if not args:
+            continue
+        name = Path(args[0]).name
+        if name != "Xorg":
+            continue
+        auth = None
+        for i, a in enumerate(args):
+            if a == "-auth" and i + 1 < len(args):
+                auth = args[i + 1]
+                break
+        uid = proc_uid(pid)
+        found.append({"pid": pid.name, "uid": uid, "auth": auth})
+    return found
+
+
+def displays_for_uid(uid: int | None) -> list[str]:
+    displays: list[str] = []
+    sockdir = Path("/tmp/.X11-unix")
+    if not sockdir.is_dir() or uid is None:
+        return displays
+    for sock in sockdir.glob("X*"):
+        try:
+            if sock.stat().st_uid != uid:
+                continue
+        except OSError:
+            continue
+        n = sock.name[1:]
+        if n.isdigit():
+            displays.append(f":{n}")
+    return displays
+
+
+def xset_off_timeout(display: str, auth: str | None, seconds: int) -> bool:
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    if auth:
+        env["XAUTHORITY"] = auth
+    try:
+        q = subprocess.run(
+            ["xset", "q"],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if q.returncode != 0:
+            return False
+        have = None
+        for line in q.stdout.splitlines():
+            if "Standby:" in line and "Off:" in line:
+                have = int(line.split("Off:")[1].split()[0])
+                break
+        if have == seconds:
+            return False
+        subprocess.run(["xset", "+dpms"], env=env, check=False, timeout=3)
+        subprocess.run(["xset", "s", "off"], env=env, check=False, timeout=3)
+        subprocess.run(
+            ["xset", "dpms", "0", "0", str(seconds)],
+            env=env,
+            check=False,
+            timeout=3,
+        )
+        log(f"{display} DPMS Off {have} -> {seconds}s")
+        return True
+    except (ValueError, IndexError, subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def apply_all(seconds: int) -> None:
+    for xorg in iter_xorg():
+        displays = displays_for_uid(xorg["uid"])
+        if not displays:
+            continue
+        for display in displays:
+            xset_off_timeout(display, xorg["auth"], seconds)
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    log("started (system, all X servers including GDM)")
+    while True:
+        timeout = 0 if idle_inhibited() else max(0, desired_timeout())
+        apply_all(timeout)
+        time.sleep(POLL_SEC)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
